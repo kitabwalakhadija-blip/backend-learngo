@@ -3,6 +3,7 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 const express = require("express");
 const cors = require("cors");
+const mongoose = require("mongoose");
 
 const connectDB = require("./config/db");
 
@@ -25,6 +26,85 @@ const Contact = require("./models/ContactUstable");
 const Followup = require("./models/Followuptable");
 const Course = require("./models/Coursetable");
 const Faculty = require("./models/Facultytable");
+
+const normalizeOptionalNumber = (value) => {
+  if (value === "" || value === null || value === undefined) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? undefined : parsed;
+};
+
+const normalizeEnquiryPayload = (data = {}) => {
+  const payload = { ...data };
+
+  delete payload._id;
+  delete payload.__v;
+  delete payload.Eid;
+  delete payload.__rowId;
+
+  payload.phone = normalizeOptionalNumber(payload.phone);
+  payload.ContactNo = normalizeOptionalNumber(payload.ContactNo);
+
+  if (payload.CID === "" || payload.CID === null || payload.CID === undefined) {
+    delete payload.CID;
+  }
+
+  payload.CID = normalizeOptionalNumber(payload.CID);
+
+  if (payload.CID === undefined) {
+    delete payload.CID;
+  }
+
+  return payload;
+};
+
+const pickEnquiryFields = (data = {}) => {
+  const allowedFields = [
+    "EnquiryDate",
+    "Department",
+    "ConsellerName",
+    "WantToTakeAdmission",
+    "Qualification",
+    "Percentage",
+    "SuggestedCourse",
+    "PurposeOfCourse",
+    "CID",
+    "student_name",
+    "phone",
+    "mobile",
+    "email",
+    "permanent_address",
+    "temporary_address",
+    "ContactNo",
+    "father_name",
+    "Occupation_father",
+    "organisation",
+    "designation",
+    "mother_name",
+    "Occupation_mother",
+    "Siblings",
+    "HowDidYouComeToKnowAboutUs",
+  ];
+
+  return allowedFields.reduce((acc, key) => {
+    if (data[key] !== undefined) {
+      acc[key] = data[key];
+    }
+
+    return acc;
+  }, {});
+};
+
+const getNextSequenceValue = async (Model, field) => {
+  const lastRecord = await Model.findOne({ [field]: { $type: "number" } })
+    .sort({ [field]: -1 })
+    .select(field)
+    .lean();
+
+  return (lastRecord?.[field] || 0) + 1;
+};
 
 /* ================= HOME ================= */
 
@@ -91,9 +171,18 @@ app.delete("/api/Facultytable/:id", async (req, res) => {
 });
 app.put("/api/Facultytable/:id", async (req, res) => {
   try {
-    const updated = await Faculty.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-    });
+    const updated = await Faculty.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updated) {
+      return res.status(404).json({ message: "Faculty not found" });
+    }
 
     res.json(updated);
   } catch (error) {
@@ -106,11 +195,13 @@ app.put("/api/Facultytable/:id", async (req, res) => {
 
 app.post("/api/Enquirytable", async (req, res) => {
   try {
-    let data = req.body;
+    let data = normalizeEnquiryPayload(req.body);
+    data.EnquiryDate = data.EnquiryDate || new Date();
+    data.Eid = await getNextSequenceValue(Enquiry, "Eid");
 
     let course = null;
 
-    if (data.WantToTakeAdmission) {
+    if (!data.CID && data.WantToTakeAdmission) {
       const typedCourse = data.WantToTakeAdmission.toLowerCase()
         .replace(/\./g, "")
         .replace(/\s+/g, "")
@@ -146,7 +237,18 @@ app.post("/api/Enquirytable", async (req, res) => {
     console.log("Matched Course:", course);
 
     if (course) {
-      data.CID = course._id;
+      if (typeof course.Id === "number") {
+        data.CID = course.Id;
+      } else {
+        const orderedCourses = await Course.find().sort({ _id: 1 }).lean();
+        const fallbackIndex = orderedCourses.findIndex(
+          (orderedCourse) => String(orderedCourse._id) === String(course._id),
+        );
+
+        if (fallbackIndex >= 0) {
+          data.CID = fallbackIndex + 1;
+        }
+      }
     }
 
     console.log("Final CID:", data.CID);
@@ -155,7 +257,8 @@ app.post("/api/Enquirytable", async (req, res) => {
     const savedEnquiry = await enquiry.save();
 
     const followup = new Followup({
-      Eid: savedEnquiry._id,
+      Eid: savedEnquiry.Eid,
+      sourceEnquiryId: savedEnquiry._id,
       student_name: savedEnquiry.student_name || "",
       phone: savedEnquiry.phone || "",
       permanent_address: savedEnquiry.permanent_address || "",
@@ -167,7 +270,7 @@ app.post("/api/Enquirytable", async (req, res) => {
       Cname: "",
       followup_detail: "",
       response: "",
-      EnquiryDate: new Date(),
+      EnquiryDate: savedEnquiry.EnquiryDate || new Date(),
       FollowupDate: null,
     });
 
@@ -176,13 +279,26 @@ app.post("/api/Enquirytable", async (req, res) => {
     res.json(savedEnquiry);
   } catch (error) {
     console.error("ENQUIRY ERROR:", error);
-    res.status(500).json(error);
+    res.status(500).json({
+      message: error.message || "Failed to save enquiry",
+      details: error.errors || null,
+    });
   }
 });
 app.get("/api/Enquirytable", async (req, res) => {
   try {
-    const enquiries = await Enquiry.find().populate("CID");
-    res.json(enquiries);
+    const enquiries = await Enquiry.find()
+      .sort({ EnquiryDate: -1, _id: -1 });
+    const normalizedEnquiries = enquiries.map((enquiry, index) => {
+      const record = enquiry.toObject();
+
+      return {
+        ...record,
+        Eid: index + 1,
+      };
+    });
+
+    res.json(normalizedEnquiries);
   } catch (error) {
     res.status(500).json(error);
   }
@@ -196,13 +312,88 @@ app.delete("/api/Enquirytable/:id", async (req, res) => {
     res.status(500).json(error);
   }
 });
+app.put("/api/Enquirytable/:id", async (req, res) => {
+  try {
+    const rawIds = [
+      req.params.id,
+      req.body?.Eid,
+      req.body?._id,
+      req.body?.__rowId,
+    ];
+    const candidateId = rawIds.find((value) => {
+      if (value === null || value === undefined || value === "") {
+        return false;
+      }
+      return true;
+    });
+    const updateData = pickEnquiryFields(normalizeEnquiryPayload(req.body));
+
+    console.log("ENQUIRY UPDATE ID:", candidateId);
+    console.log("ENQUIRY UPDATE DATA:", updateData);
+
+    if (!candidateId) {
+      return res.status(400).json({ message: "Invalid enquiry id" });
+    }
+
+    const updated = await Enquiry.findByIdAndUpdate(
+      candidateId,
+      { $set: updateData },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updated) {
+      return res.status(404).json({ message: "Enquiry not found" });
+    }
+
+    res.json(updated);
+  } catch (error) {
+    console.log("ENQUIRY UPDATE ERROR:", error);
+    res.status(500).json({
+      message: error.message || "Failed to update enquiry",
+      name: error.name || "Error",
+      details: error.errors || null,
+    });
+  }
+});
+
 
 /* ================= FOLLOWUP ROUTES ================= */
 
+app.post("/api/Followuptable", async (req, res) => {
+  try {
+    const payload = { ...req.body };
+
+    if (payload.Eid !== undefined && payload.Eid !== null && payload.Eid !== "") {
+      payload.Eid = Number(payload.Eid);
+    } else {
+      payload.Eid = await getNextSequenceValue(Followup, "Eid");
+    }
+
+    const followup = new Followup(payload);
+    const savedFollowup = await followup.save();
+    res.json(savedFollowup);
+  } catch (error) {
+    console.error("FOLLOWUP SAVE ERROR:", error);
+    res.status(500).json(error);
+  }
+});
+
 app.get("/api/Followuptable", async (req, res) => {
   try {
-    const followups = await Followup.find();
-    res.json(followups);
+    const followups = await Followup.find().sort({ EnquiryDate: -1, _id: -1 });
+    const normalizedFollowups = followups.map((followup, index) => {
+      const record = followup.toObject();
+
+      return {
+        ...record,
+        Eid: typeof record.Eid === "number" ? record.Eid : index + 1,
+      };
+    });
+
+    res.json(normalizedFollowups);
   } catch (error) {
     res.status(500).json(error);
   }
@@ -216,6 +407,28 @@ app.delete("/api/Followuptable/:id", async (req, res) => {
     res.status(500).json(error);
   }
 });
+app.put("/api/Followuptable/:id", async (req, res) => {
+  try {
+    const updated = await Followup.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updated) {
+      return res.status(404).json({ message: "Followup not found" });
+    }
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json(error);
+  }
+});
+
+
 
 /* ================= CONTACT ROUTES ================= */
 
@@ -223,7 +436,7 @@ app.post("/api/ContactUstable", async (req, res) => {
   try {
     const newContact = new Contact(req.body);
     await newContact.save();
-    res.json(newContact);
+    res.json(newContact);     
   } catch (error) {
     res.status(500).json(error);
   }
@@ -247,11 +460,37 @@ app.delete("/api/ContactUstable/:id", async (req, res) => {
   }
 });
 
-/* ================= COURSE ROUTES ================= */
+app.put("/api/ContactUstable/:id", async (req, res) => {
+  try {
+    const updated = await Contact.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updated) {
+      return res.status(404).json({ message: "Contact not found" });
+    }
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json(error);
+  }
+});
+
+
+
+/* ================= COURSE ROUTES =================  */
 
 app.post("/api/Coursetable", async (req, res) => {
   try {
-    const course = new Course(req.body);
+    const course = new Course({
+      ...req.body,
+      Id: await getNextSequenceValue(Course, "Id"),
+    });
     const saved = await course.save();
     res.json(saved);
   } catch (err) {
@@ -261,8 +500,17 @@ app.post("/api/Coursetable", async (req, res) => {
 
 app.get("/api/Coursetable", async (req, res) => {
   try {
-    const courses = await Course.find();
-    res.json(courses);
+    const courses = await Course.find().sort({ _id: 1 });
+    const normalizedCourses = courses.map((course, index) => {
+      const record = course.toObject();
+
+      return {
+        ...record,
+        Id: record.Id || index + 1,
+      };
+    });
+
+    res.json(normalizedCourses);
   } catch (error) {
     res.status(500).json(error);
   }
@@ -270,9 +518,30 @@ app.get("/api/Coursetable", async (req, res) => {
 
 app.delete("/api/Coursetable/:id", async (req, res) => {
   try {
-    await Course.findByIdAndDelete(req.params.id);
+    await Course.findByIdAndDelete(req.params.id); 
     res.json({ message: "Course Deleted" });
   } catch (error) {
+    res.status(500).json(error);
+  }
+});
+app.put("/api/Coursetable/:id", async (req, res) => {
+  try {
+    const updatedCourse = await Course.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updatedCourse) {
+      return res.status(404).json({ message: "Course not found" });
+    }
+
+    res.json(updatedCourse);
+  } catch (error) {
+    console.log("COURSE UPDATE ERROR:", error);
     res.status(500).json(error);
   }
 });

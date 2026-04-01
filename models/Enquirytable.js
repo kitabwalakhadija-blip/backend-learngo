@@ -54,6 +54,11 @@
 const mongoose = require("mongoose");
 
 const enquirySchema = new mongoose.Schema({
+  Eid: Number,
+  EnquiryDate: {
+    type: Date,
+    default: Date.now,
+  },
   Department: String,
   ConsellerName: String,
   WantToTakeAdmission: String,
@@ -61,10 +66,8 @@ const enquirySchema = new mongoose.Schema({
   Percentage: String,
   SuggestedCourse: String,
   PurposeOfCourse: String,
-  CID: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Coursetable",
-  },
+  CID: Number,
+  
   student_name: String,
   phone: Number,
   mobile: String,

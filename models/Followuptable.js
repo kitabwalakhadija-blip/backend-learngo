@@ -1,7 +1,11 @@
 const mongoose = require("mongoose");
 
 const FollowuptableSchema = new mongoose.Schema({
-  Eid: String,
+  Eid: Number,
+  sourceEnquiryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Enquirytable",
+  },
 
   student_name: String,
   phone: Number,

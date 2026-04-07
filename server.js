@@ -27,6 +27,77 @@ const Followup = require("./models/Followuptable");
 const Course = require("./models/Coursetable");
 const Faculty = require("./models/Facultytable");
 
+const deleteByFlexibleId = async (Model, id, fallbackField) => {
+  if (id === null || id === undefined || id === "") {
+    return null;
+  }
+
+  if (mongoose.Types.ObjectId.isValid(String(id))) {
+    const deletedByObjectId = await Model.findByIdAndDelete(id);
+    if (deletedByObjectId) {
+      return deletedByObjectId;
+    }
+  }
+
+  if (!fallbackField) {
+    return null;
+  }
+
+  const normalizedId = Number.isNaN(Number(id)) ? id : Number(id);
+  return Model.findOneAndDelete({ [fallbackField]: normalizedId });
+};
+
+const deleteByCandidateIds = async (Model, candidates = [], fallbackFields = []) => {
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined || candidate === "") {
+      continue;
+    }
+
+    if (mongoose.Types.ObjectId.isValid(String(candidate))) {
+      const deletedByObjectId = await Model.findByIdAndDelete(candidate);
+      if (deletedByObjectId) {
+        return deletedByObjectId;
+      }
+    }
+
+    for (const field of fallbackFields) {
+      const normalizedCandidate = Number.isNaN(Number(candidate))
+        ? candidate
+        : Number(candidate);
+      const deletedByFallback = await Model.findOneAndDelete({
+        [field]: normalizedCandidate,
+      });
+
+      if (deletedByFallback) {
+        return deletedByFallback;
+      }
+    }
+  }
+
+  return null;
+};
+
+const deleteByDisplayIndex = async (Model, displayIndex, sort) => {
+  const numericIndex = Number(displayIndex);
+
+  if (!Number.isInteger(numericIndex) || numericIndex <= 0) {
+    return null;
+  }
+
+  const records = await Model.find()
+    .sort(sort)
+    .skip(numericIndex - 1)
+    .limit(1);
+
+  const targetRecord = records[0];
+
+  if (!targetRecord) {
+    return null;
+  }
+
+  return Model.findByIdAndDelete(targetRecord._id);
+};
+
 const normalizeOptionalNumber = (value) => {
   if (value === "" || value === null || value === undefined) {
     return undefined;
@@ -294,7 +365,7 @@ app.get("/api/Enquirytable", async (req, res) => {
 
       return {
         ...record,
-        Eid: index + 1,
+        Eid: typeof record.Eid === "number" ? record.Eid : index + 1,
       };
     });
 
@@ -306,8 +377,39 @@ app.get("/api/Enquirytable", async (req, res) => {
 
 app.delete("/api/Enquirytable/:id", async (req, res) => {
   try {
-    await Enquiry.findByIdAndDelete(req.params.id);
-    res.json({ message: "Enquiry Deleted" });
+    let deleted = await deleteByCandidateIds(
+      Enquiry,
+      [
+        req.params.id,
+        req.body?._id,
+        req.body?.__rowId,
+        req.body?.Eid,
+      ],
+      ["Eid"],
+    );
+
+    if (!deleted) {
+      deleted = await deleteByDisplayIndex(
+        Enquiry,
+        req.params.id,
+        { EnquiryDate: -1, _id: -1 },
+      );
+    }
+
+    if (!deleted) {
+      return res.status(404).json({ message: "Enquiry not found" });
+    }
+
+    const followupDeleteFilter = {
+      $or: [
+        { sourceEnquiryId: deleted._id },
+        { Eid: deleted.Eid },
+      ],
+    };
+
+    await Followup.deleteMany(followupDeleteFilter);
+
+    res.json({ message: "Enquiry and related follow-up records deleted" });
   } catch (error) {
     res.status(500).json(error);
   }
@@ -401,7 +503,29 @@ app.get("/api/Followuptable", async (req, res) => {
 
 app.delete("/api/Followuptable/:id", async (req, res) => {
   try {
-    await Followup.findByIdAndDelete(req.params.id);
+    let deleted = await deleteByCandidateIds(
+      Followup,
+      [
+        req.params.id,
+        req.body?._id,
+        req.body?.sourceEnquiryId,
+        req.body?.Eid,
+      ],
+      ["Eid", "sourceEnquiryId"],
+    );
+
+    if (!deleted) {
+      deleted = await deleteByDisplayIndex(
+        Followup,
+        req.params.id,
+        { EnquiryDate: -1, _id: -1 },
+      );
+    }
+
+    if (!deleted) {
+      return res.status(404).json({ message: "Follow-up not found" });
+    }
+
     res.json({ message: "Followup Deleted" });
   } catch (error) {
     res.status(500).json(error);
@@ -453,7 +577,12 @@ app.get("/api/ContactUstable", async (req, res) => {
 
 app.delete("/api/ContactUstable/:id", async (req, res) => {
   try {
-    await Contact.findByIdAndDelete(req.params.id);
+    const deleted = await deleteByFlexibleId(Contact, req.params.id);
+
+    if (!deleted) {
+      return res.status(404).json({ message: "Contact not found" });
+    }
+
     res.json({ message: "Contact Deleted" });
   } catch (error) {
     res.status(500).json(error);
@@ -518,7 +647,12 @@ app.get("/api/Coursetable", async (req, res) => {
 
 app.delete("/api/Coursetable/:id", async (req, res) => {
   try {
-    await Course.findByIdAndDelete(req.params.id); 
+    const deleted = await deleteByFlexibleId(Course, req.params.id, "Id");
+
+    if (!deleted) {
+      return res.status(404).json({ message: "Course not found" });
+    }
+
     res.json({ message: "Course Deleted" });
   } catch (error) {
     res.status(500).json(error);
